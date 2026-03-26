@@ -1,0 +1,53 @@
+1. Copia CPU → GPU
+
+a_cpu = rand(Float32, 1024)
+a_gpu = AMDGPU.Array(a_cpu)  # Copia esplicita host → device
+
+2. Copia GPU → CPU
+
+result = Array(a_gpu)  # Copia esplicita device → host
+
+Questo è l'equivalente di mappare e leggere/scrivere da buffer in OpenCL, ma in Julia si fa in maniera più idiomatica.
+
+--------------
+
+
+@kernel function add!(a, b, c)
+    i = @index(Global)
+    if i <= length(a)
+        c[i] = a[i] + b[i]
+    end
+end
+
+UGUALE a c .= a .+ b
+è integrato in julia la vettorizzazione su gpu in automatio
+
+----- LIMITAZIONI -----
+@shared non esiste/esposto ancora in kernelabstraction
+
+Ottimizzazione	 Fattibile in Julia?	         Note
+Shared memory	   ⚠️ Parziale	              Serve supporto @localmem o scrittura più bassa
+Blocchi scan	   ✅ Sì, con più kernel	      Richiede 2–3 passaggi
+Warp shuffle	   ❌ Non ancora	              Non esposto in alto livello
+Vectorizzato	   ⚠️ Sperimentale	          Serve array di NTuple
+Algoritmi ibridi   ✅	                      Richiede scriverli a mano
+
+------
+
+Stato iniziale: [a, b, c, d, e, f, g, h]
+                 1  2  3  4  5  6  7  8  (lidx)
+
+d=1, stride=1:  [a, a+b, c, c+d, e, e+f, g, g+h]
+                    ^     ^       ^       ^
+                 thread 2,4,6,8 attivi
+
+d=2, stride=2:  [a, a+b, c, a+b+c+d, e, e+f, g, e+f+g+h]
+                             ^                   ^
+                         thread 4,8 attivi
+
+d=3, stride=4:  [a, a+b, c, a+b+c+d, e, e+f, g, a+...+h]
+                                                     ^
+                                               thread 8 attivo
+----------
+Bug/Errori
+https://github.com/JuliaGPU/KernelAbstractions.jl/issues/544

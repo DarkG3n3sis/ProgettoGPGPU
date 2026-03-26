@@ -1,0 +1,189 @@
+/* =========================================================================
+ * findall_lmem.ocl  —  scan ricorsiva a 3 livelli, completamente parallela
+ *
+ * Nessun limite pratico su nels (fino a lws^3, con lws=256 -> 16M,
+ * con lws=1024 -> 1G).
+ *
+ * Ogni work-item fa O(1) lavoro per kernel. Massimo parallelismo.
+ *
+ * Pipeline (7 kernel, O(N) traffico memoria):
+ *   1. scan_local_k0   : scan per blocco su input[]     -> scan0[], sums0[]
+ *   2. scan_local_k1   : scan per blocco su sums0[]     -> scan1[], sums1[]
+ *   3. scan_local_k2   : scan blocco singolo su sums1[] -> offsets1[]
+ *   4. apply_k1        : scan0_global = scan1[] + offsets1[grp]
+ *   5. apply_k0        : scan_global  = scan0[] + scan1_global[grp]
+ *   6. findall_gpu     : scatter indici positivi
+ *
+ * Algoritmo scan locale: Hillis-Steele con pattern corretto su GPU:
+ *   addend = lmem[li - stride]   <- leggi PRIMA del barrier
+ *   barrier()
+ *   lmem[li] += addend           <- scrivi DOPO il barrier
+ *   barrier()
+ * ========================================================================= */
+
+/* -------------------------------------------------------------------------
+ * Macro helper: Hillis-Steele inclusive scan su lmem[0..lws-1]
+ * Usa la variabile locale `addend` — deve essere dichiarata prima.
+ * ------------------------------------------------------------------------- */
+#define SCAN_LOCAL(lmem, li, lws)                          \
+    for (int _stride = 1; _stride < (lws); _stride *= 2) {\
+        int addend = ((li) >= _stride) ? (lmem)[(li) - _stride] : 0; \
+        barrier(CLK_LOCAL_MEM_FENCE);                      \
+        (lmem)[(li)] += addend;                            \
+        barrier(CLK_LOCAL_MEM_FENCE);                      \
+    }
+
+/* -------------------------------------------------------------------------
+ * scan_local_k0
+ *
+ * Primo livello: legge input[] (char), scrive:
+ *   d_flags[gi]    = flag grezzo 0/1
+ *   d_scan0[gi]    = prefix-sum inclusiva del blocco
+ *   d_sums0[grp]   = somma totale del blocco
+ * ------------------------------------------------------------------------- */
+kernel void scan_local_k0(
+    global int        * restrict d_flags,
+    global int        * restrict d_scan0,
+    global int        * restrict d_sums0,
+    global const char * restrict input,
+    int nels,
+    local  int        * lmem)
+{
+    const int gi  = get_global_id(0);
+    const int li  = get_local_id(0);
+    const int lws = get_local_size(0);
+    const int grp = get_group_id(0);
+
+    int flag = (gi < nels && input[gi] > 0) ? 1 : 0;
+    if (gi < nels) d_flags[gi] = flag;
+    lmem[li] = flag;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    SCAN_LOCAL(lmem, li, lws)
+
+    if (gi < nels)        d_scan0[gi] = lmem[li];
+    if (li == lws - 1) {
+        int last_li = min(lws - 1, nels - 1 - grp * lws);
+        d_sums0[grp] = lmem[last_li];
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * scan_local_k1
+ *
+ * Secondo livello: legge d_sums0[] (num_groups_0 elementi), scrive:
+ *   d_scan1[gi]    = prefix-sum inclusiva del blocco
+ *   d_sums1[grp]   = somma totale del blocco
+ * ------------------------------------------------------------------------- */
+kernel void scan_local_k1(
+    global int       * restrict d_scan1,
+    global int       * restrict d_sums1,
+    global const int * restrict d_sums0,
+    int n1,
+    local  int       * lmem)
+{
+    const int gi  = get_global_id(0);
+    const int li  = get_local_id(0);
+    const int lws = get_local_size(0);
+    const int grp = get_group_id(0);
+
+    lmem[li] = (gi < n1) ? d_sums0[gi] : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    SCAN_LOCAL(lmem, li, lws)
+
+    if (gi < n1)        d_scan1[gi] = lmem[li];
+    if (li == lws - 1) {
+        int last_li = min(lws - 1, n1 - 1 - grp * lws);
+        d_sums1[grp] = lmem[last_li];
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * scan_local_k2
+ *
+ * Terzo livello (blocco singolo): legge d_sums1[], scrive d_offsets1[].
+ * Produce la prefix-sum ESCLUSIVA: d_offsets1[g] = sum(d_sums1[0..g-1])
+ * ------------------------------------------------------------------------- */
+kernel void scan_local_k2(
+    global int       * restrict d_offsets1,
+    global const int * restrict d_sums1,
+    int n2,
+    local  int       * lmem)
+{
+    const int li  = get_local_id(0);
+    const int lws = get_local_size(0);
+
+    lmem[li] = (li < n2) ? d_sums1[li] : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    SCAN_LOCAL(lmem, li, lws)
+
+    /* inclusive -> exclusive */
+    if (li < n2)
+        d_offsets1[li] = (li == 0) ? 0 : lmem[li - 1];
+}
+
+/* -------------------------------------------------------------------------
+ * apply_k1
+ *
+ * Propaga gli offset del livello 2 al livello 1:
+ *   d_scan1_global[gi] = d_scan1[gi] + d_offsets1[grp]
+ * Produce la prefix-sum globale di d_sums0[].
+ * ------------------------------------------------------------------------- */
+kernel void apply_k1(
+    global int       * restrict d_scan1_global,
+    global const int * restrict d_scan1,
+    global const int * restrict d_offsets1,
+    int n1)
+{
+    const int gi  = get_global_id(0);
+    if (gi >= n1) return;
+    d_scan1_global[gi] = d_scan1[gi] + d_offsets1[get_group_id(0)];
+}
+
+/* -------------------------------------------------------------------------
+ * apply_k0
+ *
+ * Propaga gli offset del livello 1 (ora globali) al livello 0:
+ *   d_scan_global[gi] = d_scan0[gi] + d_scan1_global[grp]
+ *
+ * d_scan1_global[grp] e' la somma di tutti i blocchi 0..grp-1 del livello 0,
+ * cioe' esattamente l'offset da aggiungere al blocco grp.
+ * Nota: usiamo d_scan1_global[grp-1] come offset esclusivo, oppure
+ * lo costruiamo come: offset = (grp == 0) ? 0 : d_scan1_global[grp-1]
+ * MA d_scan1_global e' gia' la inclusive scan di d_sums0[],
+ * quindi d_scan1_global[grp] = sum(sums0[0..grp]).
+ * L'offset ESCLUSIVO per il blocco grp e':
+ *   grp == 0 ? 0 : d_scan1_global[grp - 1]
+ * ------------------------------------------------------------------------- */
+kernel void apply_k0(
+    global int       * restrict d_scan_global,
+    global const int * restrict d_scan0,
+    global const int * restrict d_scan1_global,
+    int nels)
+{
+    const int gi  = get_global_id(0);
+    if (gi >= nels) return;
+    const int grp = get_group_id(0);
+    int offset = (grp == 0) ? 0 : d_scan1_global[grp - 1];
+    d_scan_global[gi] = d_scan0[gi] + offset;
+}
+
+/* -------------------------------------------------------------------------
+ * findall_gpu
+ * ------------------------------------------------------------------------- */
+kernel void findall_gpu(
+    global int       * restrict d_output,
+    global const int * restrict d_flags,
+    global const int * restrict d_scan_global,
+    int nels)
+{
+    const int gi = get_global_id(0);
+    if (gi >= nels) return;
+    if (d_flags[gi] == 1) {
+        int out_idx = d_scan_global[gi] - 1;
+        if (out_idx >= 0 && out_idx < nels)
+            d_output[out_idx] = gi;
+    }
+}

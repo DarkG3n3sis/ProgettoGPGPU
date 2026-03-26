@@ -1,0 +1,241 @@
+kernel void mark_positive_kernel(global char * restrict flags, 
+                    global const char * restrict input, 
+                    int nels) 
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+	
+	flags[gi] = (input[gi] > 0) ? 1 : 0;
+}
+
+kernel void old_scan_local_kernel(global int * restrict scan_out,
+                 global const char * restrict flags,
+                 int nels,
+                 local int *lmem)
+{
+	const int gi = get_global_id(0);
+	const int li = get_local_id(0);
+	const int lws = get_local_size(0);
+	
+	// Inizializza memoria locale con bounds checking
+	if (gi < nels) {
+		lmem[li] = (int)flags[gi];
+	} else {
+		lmem[li] = 0;
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	// Parallel scan con protezione overflow
+	for (int stride = 1; stride < lws; stride *= 2) {
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (li >= stride) {
+			// Controllo overflow prima dell'addizione
+			int old_val = lmem[li];
+			int add_val = lmem[li - stride];
+			
+			// Verifica overflow: se old_val > 0 e add_val > INT_MAX - old_val
+			if (old_val > 0 && add_val > (INT_MAX - old_val)) {
+				// Saturation arithmetic: clamp to INT_MAX
+				lmem[li] = INT_MAX;
+			} else {
+				lmem[li] = old_val + add_val;
+			}
+		}
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	if (gi < nels) {
+		scan_out[gi] = lmem[li];
+	}
+}
+
+kernel void scan_local_kernel(global int * restrict scan_out,
+                 global const char * restrict flags,
+                 int nels,
+                 local int *lmem)
+{
+    const int gi = get_global_id(0);
+    const int li = get_local_id(0);
+    const int lws = get_local_size(0);
+    const int group_id = get_group_id(0);
+    
+    // Load input
+    if (gi < nels) {
+        lmem[li] = (int)flags[gi];
+    } else {
+        lmem[li] = 0;
+    }
+    
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Parallel prefix sum (Blelloch scan)
+    // Up-sweep (reduce) phase
+    for (int stride = 1; stride < lws; stride *= 2) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (li >= stride) {
+            lmem[li] += lmem[li - stride];
+        }
+    }
+    
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Store result
+    if (gi < nels) {
+        scan_out[gi] = lmem[li];
+    }
+}
+
+kernel void extract_block_sums(global int * restrict block_sums,
+                   global const int * restrict scan_out,
+                   int nels)
+{
+	const int gi = get_global_id(0);
+	const int li = get_local_id(0);
+	const int lws = get_local_size(0);
+	const int group_id = get_group_id(0);
+	
+	// Solo l'ultimo thread attivo di ogni gruppo salva la somma
+	if (li == lws - 1) {
+		int last_idx = (group_id + 1) * lws - 1;
+		if (last_idx >= nels) last_idx = nels - 1;
+		if (last_idx >= 0 && last_idx < nels) {
+			block_sums[group_id] = scan_out[last_idx];
+		}
+	}
+}
+
+kernel void scan_block_sums_kernel(global int * restrict block_offsets,
+                      global const int * restrict block_sums,
+                      int num_blocks,
+                      local int *lmem)
+{
+	const int li = get_local_id(0);
+	const int lws = get_local_size(0);
+	
+	// Inizializza memoria locale con bounds checking
+	if (li < num_blocks) {
+		lmem[li] = block_sums[li];
+	} else {
+		lmem[li] = 0;
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	// Parallel scan con protezione overflow
+	for (int stride = 1; stride < lws; stride *= 2) {
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (li >= stride && li < num_blocks) {
+			// Controllo overflow prima dell'addizione
+			int old_val = lmem[li];
+			int add_val = lmem[li - stride];
+			
+			if (old_val > 0 && add_val > (INT_MAX - old_val)) {
+				// Saturation arithmetic
+				lmem[li] = INT_MAX;
+			} else {
+				lmem[li] = old_val + add_val;
+			}
+		}
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	// Calcola gli offset (exclusive scan)
+	if (li < num_blocks) {
+		if (li == 0) {
+			block_offsets[li] = 0;
+		} else {
+			block_offsets[li] = lmem[li - 1];
+		}
+	}
+}
+
+kernel void apply_block_offsets(global int * restrict scan_out,
+                   global const int * restrict block_offsets,
+                   int nels)
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+	
+	const int lws = get_local_size(0);
+	const int group_id = gi / lws;
+	
+	// Controllo bounds e overflow
+	int current_val = scan_out[gi];
+	int offset = block_offsets[group_id];
+	
+	if (current_val > 0 && offset > (INT_MAX - current_val)) {
+		// Overflow protection
+		scan_out[gi] = INT_MAX;
+	} else {
+		scan_out[gi] = current_val + offset;
+	}
+}
+
+kernel void findall_gpu(global int * restrict output_indices,
+                        global const char * restrict flags,
+                        global const int * restrict scan_out,
+                        int nels)
+{
+    const int gi = get_global_id(0);
+    if (gi >= nels) return;
+
+    if (flags[gi] == 1) {
+        int out_idx = scan_out[gi] - 1; // Convert to 0-based indexing
+        
+        // Bounds checking più rigoroso
+        if (out_idx >= 0 && out_idx < nels && scan_out[gi] > 0 && scan_out[gi] != INT_MAX) {
+            output_indices[out_idx] = gi; // Store 0-based original index
+        }
+    }
+}
+
+// Kernel alternativo per array molto grandi che usa long per i contatori
+kernel void scan_local_kernel_long(global long * restrict scan_out,
+                       global const char * restrict flags,
+                       int nels,
+                       local long *lmem)
+{
+	const int gi = get_global_id(0);
+	const int li = get_local_id(0);
+	const int lws = get_local_size(0);
+	
+	// Inizializza memoria locale
+	if (gi < nels) {
+		lmem[li] = (long)flags[gi];
+	} else {
+		lmem[li] = 0;
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	// Parallel scan
+	for (int stride = 1; stride < lws; stride *= 2) {
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (li >= stride) {
+			lmem[li] += lmem[li - stride];
+		}
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	if (gi < nels) {
+		scan_out[gi] = lmem[li];
+	}
+}
+
+// Versione robusta con chunking per array enormi
+kernel void mark_positive_chunked(global char * restrict flags, 
+                        global const char * restrict input, 
+                        int nels,
+                        int chunk_offset) 
+{
+	const int gi = get_global_id(0);
+	const int real_idx = gi + chunk_offset;
+	
+	if (real_idx >= nels) return;
+	
+	flags[gi] = (input[real_idx] > 0) ? 1 : 0;
+}

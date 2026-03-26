@@ -1,0 +1,15 @@
+- Matrice di input che simula l'immagine dem (matrice di int 8 perchè?)
+- La matrice contiene:
+    const FIREBREAK::Int8 = -2
+    const UNBURNABLE::Int8 = -1
+    const BURNABLE::Int8 = 0
+    const BURNING::Int8 = 1
+    const BURNT::Int8 = 2
+Inizializzare solo con -1,0,1
+
+- probabilità del 0.5 di prendere fuoco ( non arrivo in tempo a implementare neib_contrib_cache() )
+
+- func ignite_me(x::int, y::int, new_state, cell_state, has_burning_neibs, nrows, ncols, neib_contrib_cache)
+    - cell_state: copia della matrice di input (almeno per il primo ciclo)
+    - new_state: buffer per aggiornare il vecchio stato alla fine della funzione
+    - has_burning_neibs:

@@ -1,0 +1,135 @@
+/* =========================================================================
+ * findall_lmem.ocl  —  scan per blocchi con local memory
+ *
+ * Progettata per GPU reale dove i work-item di un work-group eseguono
+ * in parallelo (warp/wavefront) e i barrier funzionano correttamente.
+ *
+ * Pipeline (4 kernel, O(N) traffico memoria totale):
+ *   1. mark_and_scan_local : scrive d_flags[] e d_scan_local[]
+ *   2. scan_block_sums     : prefix-sum esclusiva su d_block_sums[]
+ *   3. apply_offsets       : d_scan_global[i] = d_scan_local[i] + offset[grp]
+ *   4. findall_gpu         : scatter indici positivi nell'output
+ *
+ * Algoritmo scan: Hillis-Steele con pattern corretto:
+ *   addend = lmem[li - stride]   <- lettura PRIMA del barrier
+ *   barrier()
+ *   lmem[li] += addend           <- scrittura DOPO il barrier
+ *   barrier()
+ * In questo modo ogni work-item legge il valore del passo PRECEDENTE,
+ * non quello gia' aggiornato dal passo corrente.
+ * ========================================================================= */
+
+/* mark_and_scan_local
+ *
+ * Per ogni work-group:
+ *   - scrive d_flags[gi]      = 1 se input[gi] > 0, altrimenti 0
+ *   - scrive d_scan_local[gi] = prefix-sum inclusiva del blocco
+ *   - scrive d_block_sums[grp]= somma totale del blocco
+ *
+ * lmem: lws * sizeof(int)
+ */
+kernel void mark_and_scan_local(
+    global int        * restrict d_flags,       /* flag grezzo 0/1       */
+    global int        * restrict d_scan_local,  /* prefix-sum per blocco */
+    global int        * restrict d_block_sums,  /* somma totale blocco   */
+    global const char * restrict input,
+    int nels,
+    local  int        * lmem)
+{
+    const int gi  = get_global_id(0);
+    const int li  = get_local_id(0);
+    const int lws = get_local_size(0);
+    const int grp = get_group_id(0);
+
+    /* Carica flag in local memory e scrivi subito in d_flags */
+    int flag = (gi < nels && input[gi] > 0) ? 1 : 0;
+    if (gi < nels) d_flags[gi] = flag;
+    lmem[li] = flag;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    /* Hillis-Steele inclusive scan */
+    for (int stride = 1; stride < lws; stride *= 2) {
+        int addend = (li >= stride) ? lmem[li - stride] : 0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        lmem[li] += addend;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (gi < nels)
+        d_scan_local[gi] = lmem[li];
+
+    /* L'ultimo thread attivo del blocco salva la somma totale */
+    if (li == lws - 1) {
+        int last = min((grp + 1) * lws - 1, nels - 1);
+        d_block_sums[grp] = d_scan_local[last];
+    }
+}
+
+/* scan_block_sums
+ *
+ * Prefix-sum ESCLUSIVA su d_block_sums[] -> d_block_offsets[].
+ * Lanciato con un singolo work-group di dimensione lws >= num_blocks.
+ * d_block_offsets[g] = somma di d_block_sums[0..g-1]
+ *
+ * lmem: lws * sizeof(int)
+ */
+kernel void scan_block_sums(
+    global int       * restrict d_block_offsets,
+    global const int * restrict d_block_sums,
+    int num_blocks,
+    local  int       * lmem)
+{
+    const int li  = get_local_id(0);
+    const int lws = get_local_size(0);
+
+    lmem[li] = (li < num_blocks) ? d_block_sums[li] : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = 1; stride < lws; stride *= 2) {
+        int addend = (li >= stride) ? lmem[li - stride] : 0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        lmem[li] += addend;
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    /* inclusive -> exclusive */
+    if (li < num_blocks)
+        d_block_offsets[li] = (li == 0) ? 0 : lmem[li - 1];
+}
+
+/* apply_offsets
+ *
+ * Produce la prefix-sum globale:
+ *   d_scan_global[gi] = d_scan_local[gi] + d_block_offsets[grp]
+ */
+kernel void apply_offsets(
+    global int       * restrict d_scan_global,
+    global const int * restrict d_scan_local,
+    global const int * restrict d_block_offsets,
+    int nels)
+{
+    const int gi  = get_global_id(0);
+    if (gi >= nels) return;
+    d_scan_global[gi] = d_scan_local[gi] + d_block_offsets[get_group_id(0)];
+}
+
+/* findall_gpu
+ *
+ * Per ogni elemento positivo (d_flags[gi]==1):
+ *   d_output[d_scan_global[gi] - 1] = gi
+ */
+kernel void findall_gpu(
+    global int       * restrict d_output,
+    global const int * restrict d_flags,
+    global const int * restrict d_scan_global,
+    int nels)
+{
+    const int gi = get_global_id(0);
+    if (gi >= nels) return;
+
+    if (d_flags[gi] == 1) {
+        int out_idx = d_scan_global[gi] - 1;
+        if (out_idx >= 0 && out_idx < nels)
+            d_output[out_idx] = gi;
+    }
+}

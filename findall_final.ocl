@@ -1,0 +1,73 @@
+/* =========================================================================
+ * findall_v3.ocl
+ *
+ * Pipeline:
+ *   1. mark_positive_kernel    : flags[i] = (input[i] > 0) ? 1 : 0
+ *   2. scan_stride_kernel      : un lancio per ogni stride (log2(n) volte)
+ *                                implementa Kogge-Stone in global memory
+ *                                con ping-pong tra d_scan_out e d_scan_tmp
+ *   3. extract_block_sums      : (non piu' necessario - la scan e' globale)
+ *   4. findall_gpu             : scatter degli indici positivi nell'output
+ *
+ * La scan e' ora GLOBALE (non per blocco): un unico kernel con log2(n)
+ * lanci produce la prefix-sum su tutto l'array, eliminando la necessita'
+ * di block sums, scan_sums e apply_offsets.
+ *
+ * Parallelismo: ogni work-item fa O(1) lavoro per lancio, O(log n) lanci.
+ * Compatibilita': funziona su GPU reale e PoCL/CPU senza race condition,
+ * perche' la barriera globale e' il lancio del kernel successivo.
+ * ========================================================================= */
+
+/* mark_positive_kernel
+ * Fase 1: marca gli elementi positivi.
+ * Scrive anche il valore iniziale in scan_out per la fase successiva.
+ */
+kernel void mark_positive_kernel(global int  * restrict scan_out,
+                                 global const char * restrict input,
+                                 int nels)
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+	scan_out[gi] = (input[gi] > 0) ? 1 : 0;
+}
+
+/* scan_stride_kernel
+ * Fase 2: un passo della Kogge-Stone prefix-sum globale.
+ * Deve essere lanciato log2(nels) volte, con stride = 1, 2, 4, 8, ...
+ * Legge da src, scrive su dst (ping-pong su due buffer globali).
+ *
+ * Ogni lancio di questo kernel e' una barriera globale implicita.
+ * Non ci sono race condition: tutti i work-item leggono da src
+ * (non modificato da questo lancio) e scrivono su dst.
+ */
+kernel void scan_stride_kernel(global int * restrict dst,
+                               global const int * restrict src,
+                               int stride,
+                               int nels)
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+	dst[gi] = src[gi] + (gi >= stride ? src[gi - stride] : 0);
+}
+
+/* findall_gpu
+ * Fase 3: scatter degli indici.
+ * scan_out contiene la prefix-sum GLOBALE inclusiva.
+ * flags[gi] = 1 sse l'elemento originale e' positivo.
+ * output_indices[scan_out[gi]-1] = gi per ogni gi con flags[gi]==1.
+ */
+kernel void findall_gpu(global int * restrict output_indices,
+                        global const int * restrict flags,
+                        global const int * restrict scan_out,
+                        int nels)
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+
+	if (flags[gi] == 1) {
+		int out_idx = scan_out[gi] - 1;
+		if (out_idx >= 0 && out_idx < nels) {
+			output_indices[out_idx] = gi;
+		}
+	}
+}

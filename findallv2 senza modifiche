@@ -1,0 +1,282 @@
+#ENV["JULIA_DEBUG"] = "AMDGPU"
+using KernelAbstractions
+using AMDGPU
+using Cthulhu
+
+
+if true
+    const KADevice = ROCBackend()
+else
+    const KADevice = CPU()
+end
+
+const GROUP_SIZE = 16 #lws
+
+
+@kernel function mark_positive_kernel!(input, flags, N)
+    i = @index(Global)
+    if i <= N
+        flags[i] = input[i] > 0 ? 1 : 0
+        #@print("Thread ", i, ": input = ", input[i], ", flag = ", flags[i], "\n")
+    end
+end
+
+@kernel function gpu_scan_optimized!(flags, scan_out, N)
+    i = @index(Global)
+    lidx = @index(Local)
+
+    temp = @localmem(Int32, GROUP_SIZE)
+
+    # Carica una sola volta
+    if i <= N
+        temp[lidx] = Int32(flags[i])
+    else
+        temp[lidx] = Int32(0)
+    end
+
+    @synchronize()  # Solo questa sync è necessaria
+
+    # Scan senza sync intermedie - usa maschere per controllo flusso
+    # Tutte le iterazioni in parallelo con maschere
+
+    # Stride 1
+    val1 = (lidx > Int32(1)) ? temp[lidx - Int32(1)] : Int32(0)
+    temp[lidx] += val1
+
+    # Stride 2
+    val2 = (lidx > Int32(2)) ? temp[lidx - Int32(2)] : Int32(0)
+    temp[lidx] += val2
+
+    # Stride 4
+    val4 = (lidx > Int32(4)) ? temp[lidx - Int32(4)] : Int32(0)
+    temp[lidx] += val4
+
+    # Stride 8
+    val8 = (lidx > Int32(8)) ? temp[lidx - Int32(8)] : Int32(0)
+    temp[lidx] += val8
+
+    @synchronize()
+
+    if i <= N
+        scan_out[i] = temp[lidx]
+    end
+end
+
+# Versione ancora più ottimizzata - pipeline senza temp array
+@kernel function gpu_scan_pipeline!(flags, scan_out, N)
+    i = @index(Global)
+    lidx = @index(Local)
+
+    # Carica direttamente il valore
+    val = (i <= N) ? Int32(flags[i]) : Int32(0)
+
+    # Pipeline delle operazioni senza memoria intermedia
+    # Ogni thread calcola il proprio prefix sum
+
+    # Raccolta valori dai thread vicini (senza sync!)
+    if lidx > Int32(1) && (lidx - Int32(1)) >= Int32(1) && (i - Int32(1)) <= N
+        val += Int32(flags[i - Int32(1)])
+    end
+
+    if lidx > Int32(2) && (lidx - Int32(2)) >= Int32(1) && (i - Int32(2)) <= N
+        val += Int32(flags[i - Int32(2)])
+    end
+
+    if lidx > Int32(4) && (lidx - Int32(4)) >= Int32(1) && (i - Int32(4)) <= N
+        val += Int32(flags[i - Int32(4)])
+    end
+
+    if lidx > Int32(8) && (lidx - Int32(8)) >= Int32(1) && (i - Int32(8)) <= N
+        val += Int32(flags[i - Int32(8)])
+    end
+
+    if i <= N
+        scan_out[i] = val
+    end
+end
+
+# Versione con warp shuffle (se supportato da AMDGPU)
+@kernel function gpu_scan_warp!(flags, scan_out, N)
+    i = @index(Global)
+    lidx = @index(Local)
+
+    val = (i <= N) ? Int32(flags[i]) : Int32(0)
+
+    # Simula warp shuffle con shared memory efficiente
+    warp = @localmem(Int32, GROUP_SIZE)
+    warp[lidx] = val
+
+    @synchronize()
+
+    # Prefix sum in parallelo con letture multiple
+    result = val
+
+    # Accumula da tutti i thread precedenti in una volta
+    for offset in Int32(1):(lidx-Int32(1))
+        if offset <= GROUP_SIZE
+            result += warp[offset]
+        end
+    end
+
+    if i <= N
+        scan_out[i] = result
+    end
+end
+
+# Versione hybrid - combina approcci per massima velocità
+@kernel function gpu_scan_hybrid!(flags, scan_out, N)
+    i = @index(Global)
+    lidx = @index(Local)
+
+    # Fast path per piccoli gruppi
+    if GROUP_SIZE <= 32
+        # Usa approccio diretto senza shared memory
+        val = (i <= N) ? Int32(flags[i]) : Int32(0)
+
+        # Calcolo diretto del prefix sum
+        sum = Int32(0)
+        for j in Int32(1):(lidx-Int32(1))
+            global_j = i - lidx + j
+            if global_j <= N && global_j >= Int32(1)
+                sum += Int32(flags[global_j])
+            end
+        end
+        sum += val
+
+        if i <= N
+            scan_out[i] = sum
+        end
+    else
+        # Fallback al metodo ottimizzato per gruppi grandi
+        temp = @localmem(Int32, GROUP_SIZE)
+
+        if i <= N
+            temp[lidx] = Int32(flags[i])
+        else
+            temp[lidx] = Int32(0)
+        end
+
+        @synchronize()
+
+        # Scan ottimizzato con meno branches
+        temp[lidx] += (lidx > Int32(1)) ? temp[lidx - Int32(1)] : Int32(0)
+        temp[lidx] += (lidx > Int32(2)) ? temp[lidx - Int32(2)] : Int32(0)
+        temp[lidx] += (lidx > Int32(4)) ? temp[lidx - Int32(4)] : Int32(0)
+        temp[lidx] += (lidx > Int32(8)) ? temp[lidx - Int32(8)] : Int32(0)
+
+        @synchronize()
+
+        if i <= N
+            scan_out[i] = temp[lidx]
+        end
+    end
+end
+
+# Kernel finale per estrarre le posizioni
+@kernel function extract_positions!(flags, scan_out, output_indices, N)
+    i = @index(Global)
+
+    if i <= N && flags[i] == Int8(1)
+        # scan_out[i] ci dice la posizione nell'array di output
+        output_pos = scan_out[i]
+        if output_pos > 0  # Assicurati che sia valido
+            output_indices[output_pos] = Int32(i)
+        end
+    end
+end
+
+# Funzione wrapper
+function gpu_findall_positive!(input)
+    N = length(input)
+    num_blocks = cld(N, GROUP_SIZE)
+
+    flags = KernelAbstractions.zeros(KADevice, Int8, N)
+    scan_out = KernelAbstractions.zeros(KADevice, Int32, N)
+
+    #Costruisce flags
+    global_size = cld(N, GROUP_SIZE) * GROUP_SIZE
+    mark_positive_kernel!(KADevice, global_size, GROUP_SIZE)(input, flags, N)
+    KernelAbstractions.synchronize(KADevice)
+
+    #Prefix scan
+    gpu_scan_hybrid!(KADevice, global_size, GROUP_SIZE)(flags, scan_out, N)
+    KernelAbstractions.synchronize(KADevice)
+
+    #Conta quanti elementi positivi abbiamo trovato
+    total_count = Array(scan_out[N:N])[1]  # Ultimo elemento del scan
+    println("Trovati $total_count elementi positivi")
+
+    if total_count == 0
+        return KernelAbstractions.zeros(KADevice, Int32, 0)
+    end
+
+    output_indices = KernelAbstractions.zeros(KADevice, Int32, total_count)
+
+    #Estrae le posizioni
+    extract_positions!(KADevice, global_size, GROUP_SIZE)(flags, scan_out, output_indices, N)
+    KernelAbstractions.synchronize(KADevice)
+
+    return output_indices
+end
+
+function gpu_findall_positive_debug!(input)
+    N = length(input)
+
+    flags = KernelAbstractions.zeros(KADevice, Int8, N)
+    scan_out = KernelAbstractions.zeros(KADevice, Int32, N)
+
+    global_size = cld(N, GROUP_SIZE) * GROUP_SIZE
+    mark_positive_kernel!(KADevice, global_size, GROUP_SIZE)(input, flags, N)
+    KernelAbstractions.synchronize(KADevice)
+
+    println("Input: ", Array(input))
+    println("Flags: ", Array(flags))
+
+    gpu_scan_hybrid!(KADevice, global_size, GROUP_SIZE)(flags, scan_out, N)
+    KernelAbstractions.synchronize(KADevice)
+
+    println("Scan:  ", Array(scan_out))
+
+    total_count = Array(scan_out[N:N])[1]
+    println("Count: ", total_count)
+
+    if total_count > 0
+        output_indices = KernelAbstractions.zeros(KADevice, Int32, total_count)
+        extract_positions!(KADevice, global_size, GROUP_SIZE)(flags, scan_out, output_indices, N)
+        KernelAbstractions.synchronize(KADevice)
+
+        println("Positions: ", Array(output_indices))
+        return output_indices
+    end
+
+    return KernelAbstractions.zeros(KADevice, Int32, 0)
+end
+
+# Versione ultra-ottimizzata per test di performance
+@kernel function gpu_scan_minimal!(flags, scan_out, N)
+    i = @index(Global)
+
+    if i <= N
+        sum = Int32(0)
+        for j in Int32(1):i
+            if j <= N
+                sum += Int32(flags[j])
+            end
+        end
+        scan_out[i] = sum
+    end
+end
+
+function main()
+    print("a")
+    vals = Array(Int8[-1, 0, 1, 2, -2, 1, 0, 2])
+    has_burning_neibs = KADevice isa CPU ? vals : ROCArray(vals)
+    #print(typeof(has_burning_neibs))
+    print("b")
+    result = gpu_findall_positive_debug!(has_burning_neibs)
+    KernelAbstractions.synchronize(KADevice)
+    print("c")
+    print(Array(result))
+end
+
+main()

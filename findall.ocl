@@ -1,0 +1,172 @@
+kernel void mark_positive_kernel(global char * restrict flags, 
+                    global const char * restrict input, 
+                    int nels) 
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+	
+	flags[gi] = (input[gi] > 0) ? 1 : 0;
+}
+
+kernel void old_scan_local_kernel(global int * restrict scan_out,
+                 global const char * restrict flags,
+                 int nels,
+                 local int *lmem)
+{
+	const int gi = get_global_id(0);
+	const int li = get_local_id(0);
+	const int lws = get_local_size(0);
+	
+	// Inizializza memoria locale
+	if (gi < nels) {
+		lmem[li] = (int)flags[gi];
+	} else {
+		lmem[li] = 0;
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	// Parallel scan
+	for (int stride = 1; stride < lws; stride *= 2) {
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (li >= stride) {
+			lmem[li] += lmem[li - stride];
+		}
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	if (gi < nels) {
+		scan_out[gi] = lmem[li];
+	}
+}
+
+kernel void scan_local_kernel(global int * restrict scan_out,
+                 global const char * restrict flags,
+                 int nels,
+                 local int *lmem)
+{
+    const int gi = get_global_id(0);
+    const int li = get_local_id(0);
+    const int lws = get_local_size(0);
+    const int group_id = get_group_id(0);
+    
+    // Load input
+    if (gi < nels) {
+        lmem[li] = (int)flags[gi];
+    } else {
+        lmem[li] = 0;
+    }
+    
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Parallel prefix sum (Blelloch scan)
+    // Up-sweep (reduce) phase
+    for (int stride = 1; stride < lws; stride *= 2) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (li >= stride) {
+            lmem[li] += lmem[li - stride];
+        }
+    }
+    
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Store result
+    if (gi < nels) {
+        scan_out[gi] = lmem[li];
+    }
+}
+
+kernel void
+extract_block_sums(global int * restrict block_sums,
+                   global const int * restrict scan_out,
+                   int nels)
+{
+	const int gi = get_global_id(0);
+	const int li = get_local_id(0);
+	const int gws = get_global_size(0);
+	const int lws = get_local_size(0);
+	const int group_id = get_group_id(0);
+	
+	// L'ultimo thread di ogni gruppo salva la somma del blocco
+	if (li == lws - 1) {
+		int last_idx = min((group_id + 1) * lws - 1, nels - 1);
+		block_sums[group_id] = scan_out[last_idx];
+	}
+}
+
+kernel void
+scan_block_sums_kernel(global int * restrict block_offsets,
+                      global const int * restrict block_sums,
+                      int num_blocks,
+                      local int *lmem)
+{
+	const int li = get_local_id(0);
+	const int lws = get_local_size(0);
+	
+	// Inizializza memoria locale
+	if (li < num_blocks) {
+		lmem[li] = block_sums[li];
+	} else {
+		lmem[li] = 0;
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	// Parallel scan
+	for (int stride = 1; stride < lws; stride *= 2) {
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (li >= stride) {
+			lmem[li] += lmem[li - stride];
+		}
+	}
+	
+	barrier(CLK_LOCAL_MEM_FENCE);
+	
+	if (li < num_blocks) {
+		block_offsets[li] = (li == 0) ? 0 : lmem[li - 1];
+	}
+}
+
+kernel void apply_block_offsets(global int * restrict scan_out,
+                   global const int * restrict block_offsets,
+                   int nels)
+{
+	const int gi = get_global_id(0);
+	const int lws = get_local_size(0);
+	const int group_id = gi / lws;
+	
+	if (gi < nels) {
+		scan_out[gi] += block_offsets[group_id];
+	}
+}
+
+kernel void _findall_gpu(global int * restrict output_indices,
+           global const char * restrict flags,
+           global const int * restrict scan_out,
+           int nels)
+{
+	const int gi = get_global_id(0);
+	if (gi >= nels) return;
+	
+	if (flags[gi] == 1) {
+		int out_idx = scan_out[gi] - 1; // Convert to 0-based indexing
+		output_indices[out_idx] = gi + 1; // Store 1-based index
+	}
+}
+
+kernel void findall_gpu(global int * restrict output_indices,
+                        global const char * restrict flags,
+                        global const int * restrict scan_out,
+                        int nels)
+{
+    const int gi = get_global_id(0);
+    if (gi >= nels) return;
+
+    if (flags[gi] == 1) {
+        int out_idx = scan_out[gi] - 1; // già 0-based ora
+        if (out_idx >= 0 && out_idx < nels) { // sicurezza: evita out-of-bounds
+            output_indices[out_idx] = gi; // salva indice originale (0-based)
+        }
+    }
+}
