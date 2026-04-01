@@ -1,8 +1,6 @@
 /* =========================================================================
  * findall_lmem.ocl  —  scan per blocchi con local memory
  *
- * Progettata per GPU reale dove i work-item di un work-group eseguono
- * in parallelo (warp/wavefront) e i barrier funzionano correttamente.
  *
  * Pipeline (4 kernel, O(N) traffico memoria totale):
  *   1. mark_and_scan_local : scrive d_flags[] e d_scan_local[]
@@ -10,7 +8,7 @@
  *   3. apply_offsets       : d_scan_global[i] = d_scan_local[i] + offset[grp]
  *   4. findall_gpu         : scatter indici positivi nell'output
  *
- * Algoritmo scan: Hillis-Steele con pattern corretto:
+ * Algoritmo scan: Hillis-Steele:
  *   addend = lmem[li - stride]   <- lettura PRIMA del barrier
  *   barrier()
  *   lmem[li] += addend           <- scrittura DOPO il barrier
@@ -58,11 +56,9 @@ kernel void mark_and_scan_local(
     if (gi < nels)
         d_scan_local[gi] = lmem[li];
 
-    /* L'ultimo thread attivo del blocco salva la somma totale */
-    if (li == lws - 1) {
-        int last = min((grp + 1) * lws - 1, nels - 1);
-        d_block_sums[grp] = d_scan_local[last];
-    }
+    /* lmem[lws-1] is the block total: out-of-range lanes loaded 0 */
+    if (li == lws - 1)
+        d_block_sums[grp] = lmem[li];
 }
 
 /* scan_block_sums

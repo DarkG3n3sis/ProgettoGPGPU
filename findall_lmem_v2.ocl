@@ -1,5 +1,5 @@
 /* =========================================================================
- * findall_lmem.ocl  —  scan ricorsiva a 3 livelli, completamente parallela
+ * findall_lmem_v2.ocl  —  scan ricorsiva a 3 livelli, completamente parallela
  *
  * Nessun limite pratico su nels (fino a lws^3, con lws=256 -> 16M,
  * con lws=1024 -> 1G).
@@ -62,10 +62,10 @@ kernel void scan_local_k0(
     SCAN_LOCAL(lmem, li, lws)
 
     if (gi < nels)        d_scan0[gi] = lmem[li];
-    if (li == lws - 1) {
-        int last_li = min(lws - 1, nels - 1 - grp * lws);
-        d_sums0[grp] = lmem[last_li];
-    }
+    /* lmem[lws-1] is always the block total: out-of-range lanes loaded 0,
+     * so the inclusive scan at the last lane equals sum of valid flags. */
+    if (li == lws - 1)
+        d_sums0[grp] = lmem[li];
 }
 
 /* -------------------------------------------------------------------------
@@ -93,10 +93,9 @@ kernel void scan_local_k1(
     SCAN_LOCAL(lmem, li, lws)
 
     if (gi < n1)        d_scan1[gi] = lmem[li];
-    if (li == lws - 1) {
-        int last_li = min(lws - 1, n1 - 1 - grp * lws);
-        d_sums1[grp] = lmem[last_li];
-    }
+    /* Same reasoning as scan_local_k0: use lmem[lws-1] directly. */
+    if (li == lws - 1)
+        d_sums1[grp] = lmem[li];
 }
 
 /* -------------------------------------------------------------------------
